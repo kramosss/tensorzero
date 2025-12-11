@@ -256,28 +256,15 @@ If `true`, then the migrations are not applied upon launch and must instead be a
 by running `docker run --rm -e TENSORZERO_CLICKHOUSE_URL=$TENSORZERO_CLICKHOUSE_URL tensorzero/gateway:{version} --run-clickhouse-migrations` or `docker compose run --rm gateway --run-clickhouse-migrations`.
 If `false`, then the migrations are run automatically upon launch.
 
-### `template_filesystem_access`
+### `template_filesystem_access.base_path`
 
-- **Type:** object
+- **Type:** string
 - **Required:** no (default disabled)
 
-Enabling this setting will allow MiniJinja templates to load sub-templates from the file system using the `include` directive.
+Set `template_filesystem_access.base_path` to allow MiniJinja templates to load sub-templates using the `{% include %}` and `{% import %}` directives.
 
-The object has two fields:
-
-- `enabled` (boolean): Determines whether to enable file system access for templates.
-- `base_path` (string, optional): Determines the base path for template file system access.
-
-If you use a single configuration file, the `base_path` will be the directory containing the configuration file.
-If you split your configuration into multiple files, you must specify `gateway.template_filesystem_access.base_path` (see [Organize your configuration](/operations/organize-your-configuration) for details).
-The `include` paths must be relative to `base_path`, and can only access files in that directory or its sub-directories.
-
-<Warning>
-
-Make sure to sanitize all user-provided template data before using this setting.
-Otherwise, a malicious input could read unintended files in the file system.
-
-</Warning>
+The directives will be relative to `base_path` and can only access files within that directory or its subdirectories.
+The `base_path` can be absolute or relative to the configuration file's location.
 
 ## `[models.model_name]`
 
@@ -881,7 +868,7 @@ You can also deploy your own models on Fireworks AI.
 [models."llama-3.1-8b-instruct".providers.fireworks]
 # ...
 type = "fireworks"
-model_name = "accounts/fireworks/models/llama-v3p1-8b-instruct"
+model_name = "accounts/fireworks/models/llama-v3p3-70b-instruct"
 # ...
 ```
 
@@ -1444,7 +1431,7 @@ Can be either a string for a single credential location, or an object with `defa
 The supported locations are `env::ENVIRONMENT_VARIABLE` and `dynamic::ARGUMENT_NAME` (see [the API reference](/gateway/api-reference/inference/#credentials) and [Credential Management](/operations/manage-credentials/#configure-credential-fallbacks) for more details).
 
 ```toml title="tensorzero.toml"
-[models.llama3_1_8b_instruct_turbo.providers.together]
+[models.llama3_3_70b_instruct_turbo.providers.together]
 # ...
 type = "together"
 api_key_location = "dynamic::together_api_key"
@@ -1465,7 +1452,7 @@ See [Together's documentation](https://docs.together.ai/docs/chat-models) for th
 You can also deploy your own models on Together AI.
 
 ```toml title="tensorzero.toml"
-[models.llama3_1_8b_instruct_turbo.providers.together]
+[models.llama3_3_70b_instruct_turbo.providers.together]
 # ...
 type = "together"
 model_name = "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
@@ -4259,7 +4246,7 @@ If `true`, the gateway will throw an error on startup if it fails to connect to 
 If `false`, the gateway will not use PostgreSQL even if the `TENSORZERO_POSTGRES_URL` environment variable is set.
 If omitted, the gateway will connect to PostgreSQL if the `TENSORZERO_POSTGRES_URL` environment variable is set, otherwise it will disable PostgreSQL with a warning.
 
-If you have features that require PostgreSQL (rate limiting or Track-and-Stop experimentation) configured but set `postgres.enabled = false` or don't provide the `TENSORZERO_POSTGRES_URL` environment variable, the gateway will fail to start with a configuration error.
+If you have features that require PostgreSQL (e.g. rate limiting, adaptive experimentation) configured but set `postgres.enabled = false` or don't provide the `TENSORZERO_POSTGRES_URL` environment variable, the gateway will fail to start with a configuration error.
 
 ## `[rate_limiting]`
 

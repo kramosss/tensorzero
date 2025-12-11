@@ -217,7 +217,7 @@ max_tokens = 100
 
 [functions.basic_test.variants.fireworks-shorthand]
 type = "chat_completion"
-model = "fireworks::accounts/fireworks/models/llama-v3p1-8b-instruct"
+model = "fireworks::accounts/fireworks/models/llama-v3p3-70b-instruct"
 system_template = "../../../fixtures/config/functions/basic_test/prompt/system_template.minijinja"
 max_tokens = 100
 
@@ -256,6 +256,13 @@ max_tokens = 100
 [functions.basic_test.variants.gemini-bad-model-name]
 type = "chat_completion"
 model = "gemini-wrong-field"
+system_template = "../../../fixtures/config/functions/basic_test/prompt/system_template.minijinja"
+max_tokens = 100
+
+# A 'loopback' variant that connects to the gateway itself (through the openai-compatible endpoint)
+[functions.basic_test.variants.loopback-dummy]
+type = "chat_completion"
+model = "loopback-dummy"
 system_template = "../../../fixtures/config/functions/basic_test/prompt/system_template.minijinja"
 max_tokens = 100
 

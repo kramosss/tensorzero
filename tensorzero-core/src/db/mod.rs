@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 use sqlx::postgres::types::PgInterval;
 use uuid::Uuid;
 
+#[cfg(test)]
+use mockall::automock;
+
+use crate::config::snapshot::{ConfigSnapshot, SnapshotHash};
 use crate::db::datasets::DatasetQueries;
 use crate::error::Error;
 use crate::rate_limiting::ActiveRateLimitKey;
@@ -13,8 +17,11 @@ use crate::serde_util::{deserialize_option_u64, deserialize_u64};
 pub mod clickhouse;
 pub mod datasets;
 pub mod feedback;
+pub mod inference_stats;
 pub mod inferences;
+pub mod model_inferences;
 pub mod postgres;
+pub mod stored_datapoint;
 
 #[async_trait]
 pub trait ClickHouseConnection:
@@ -32,6 +39,8 @@ pub trait HealthCheckable {
 
 #[async_trait]
 pub trait SelectQueries {
+    async fn count_distinct_models_used(&self) -> Result<u32, Error>;
+
     async fn get_model_usage_timeseries(
         &self,
         time_window: TimeWindow,
@@ -42,8 +51,6 @@ pub trait SelectQueries {
         &self,
         time_window: TimeWindow,
     ) -> Result<Vec<ModelLatencyDatapoint>, Error>;
-
-    async fn count_distinct_models_used(&self) -> Result<u32, Error>;
 
     async fn query_episode_table(
         &self,
@@ -189,4 +196,13 @@ pub trait ExperimentationQueries {
         function_name: &str,
         candidate_variant_name: &str,
     ) -> Result<String, Error>;
+}
+
+#[async_trait]
+#[cfg_attr(test, automock)]
+pub trait ConfigQueries {
+    async fn get_config_snapshot(
+        &self,
+        snapshot_hash: SnapshotHash,
+    ) -> Result<ConfigSnapshot, Error>;
 }

@@ -1,180 +1,59 @@
 #![recursion_limit = "256"]
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
-use std::{collections::HashMap, path::PathBuf};
 
-use anyhow::{anyhow, bail, Result};
-use clap::Parser;
-use evaluators::{evaluate_inference, EvaluateInferenceParams};
+use anyhow::{Result, anyhow, bail};
+use evaluators::{EvaluateInferenceParams, evaluate_inference};
 use helpers::get_cache_options;
-use serde::{Deserialize, Serialize};
 
 // Public re-exports for external consumers
+pub use cli::{Args, OutputFormat};
 pub use stats::{
-    mean, std_deviation, EvaluationError, EvaluationInfo, EvaluationStats, EvaluationUpdate,
-    EvaluatorStats, PerEvaluatorStats,
+    EvaluationError, EvaluationInfo, EvaluationStats, EvaluationUpdate, EvaluatorStats,
+    PerEvaluatorStats, mean, std_deviation,
 };
+pub use tensorzero_core::evaluations::{EvaluationFunctionConfig, EvaluationFunctionConfigTable};
+pub use types::*;
+
 use tensorzero_core::cache::CacheEnabledMode;
-use tensorzero_core::client::ClientInput;
+use tensorzero_core::client::Input;
 use tensorzero_core::client::{
-    input_handling::resolved_input_to_client_input, Client, ClientBuilder, ClientBuilderMode,
-    ClientInferenceParams, DynamicToolParams, InferenceOutput, InferenceParams, InferenceResponse,
+    Client, ClientBuilder, ClientBuilderMode, ClientInferenceParams, DynamicToolParams,
+    InferenceOutput, InferenceParams, InferenceResponse,
+    input_handling::resolved_input_to_client_input,
 };
-use tensorzero_core::config::{
-    ConfigFileGlob, ConfigLoadInfo, MetricConfigOptimize, UninitializedVariantInfo,
+use tensorzero_core::config::{ConfigFileGlob, MetricConfigOptimize};
+use tensorzero_core::endpoints::datasets::v1::{
+    get_datapoints, list_datapoints,
+    types::{GetDatapointsRequest, ListDatapointsRequest},
 };
-use tensorzero_core::endpoints::datasets::v1::{list_datapoints, types::ListDatapointsRequest};
 use tensorzero_core::evaluations::{EvaluationConfig, EvaluatorConfig};
 use tensorzero_core::utils::spawn_ignoring_shutdown;
 use tensorzero_core::{
     config::Config, db::clickhouse::ClickHouseConnectionInfo, endpoints::datasets::Datapoint,
-    function::FunctionConfig,
 };
 use tokio::{
-    sync::{mpsc, Semaphore},
+    sync::{Semaphore, mpsc},
     task::JoinSet,
 };
 use tracing::{debug, error, info, instrument};
-use url::Url;
 use uuid::Uuid;
 
+pub mod cli;
 pub mod evaluators;
 pub mod helpers;
 pub mod stats;
 pub mod stopping;
+pub mod types;
 
 /// Buffer size for the mpsc channel used to stream evaluation updates.
 /// This provides backpressure if the consumer can't keep up with the producer.
 const EVALUATION_CHANNEL_BUFFER_SIZE: usize = 128;
 
-#[derive(clap::ValueEnum, Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
-#[clap(rename_all = "snake_case")]
-#[serde(rename_all = "snake_case")]
-pub enum OutputFormat {
-    Jsonl,
-    #[default]
-    Pretty,
-}
-
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-pub struct Args {
-    /// Path to tensorzero.toml.
-    #[arg(long, default_value = "./config/tensorzero.toml")]
-    pub config_file: PathBuf,
-
-    /// URL of a running TensorZero HTTP gateway server to use for requests. This runs evaluations using that gateway.
-    #[arg(long)]
-    pub gateway_url: Option<Url>,
-
-    /// Name of the evaluation to run.
-    #[arg(short, long)]
-    pub evaluation_name: String,
-
-    /// Name of the dataset to run on.
-    #[arg(short, long)]
-    pub dataset_name: String,
-
-    /// Name of the variant to run.
-    #[arg(short, long)]
-    pub variant_name: String,
-
-    /// Number of concurrent requests to make.
-    #[arg(short, long, default_value = "1")]
-    pub concurrency: usize,
-
-    #[arg(short, long, default_value = "pretty")]
-    pub format: OutputFormat,
-
-    #[arg(long, default_value = "on")]
-    pub inference_cache: CacheEnabledMode,
-
-    /// Maximum number of datapoints to evaluate from the dataset.
-    #[arg(long)]
-    pub max_datapoints: Option<u32>,
-
-    /// Per-evaluator precision targets for adaptive stopping.
-    /// Format: evaluator_name=precision_target, comma-separated for multiple evaluators.
-    /// Example: --adaptive-stopping-precision exact_match=0.13,llm_judge=0.16
-    /// Evaluator stops when confidence interval (CI) half-width (or the maximum width of the two
-    /// halves of the CI in the case of asymmetric CIs) <= precision_target.
-    #[arg(long = "adaptive-stopping-precision", value_parser = parse_precision_target, value_delimiter = ',', num_args = 0..)]
-    pub precision_targets: Vec<(String, f32)>,
-}
-
-/// Parse a single precision target in format "evaluator_name=precision_target"
-fn parse_precision_target(s: &str) -> Result<(String, f32), String> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err("Precision target cannot be empty".to_string());
-    }
-
-    let parts: Vec<&str> = s.splitn(2, '=').collect();
-    if parts.len() != 2 {
-        return Err(format!(
-            "Invalid precision format: '{s}'. Expected format: evaluator_name=precision_target"
-        ));
-    }
-
-    let evaluator_name = parts[0].to_string();
-    let precision_target = parts[1]
-        .parse::<f32>()
-        .map_err(|e| format!("Invalid precision value '{}': {e}", parts[1]))?;
-
-    if precision_target < 0.0 {
-        return Err(format!(
-            "Precision value must be non-negative, got {precision_target}"
-        ));
-    }
-
-    Ok((evaluator_name, precision_target))
-}
-
 pub struct Clients {
     pub tensorzero_client: Client,
     pub clickhouse_client: ClickHouseConnectionInfo,
-}
-
-/// Specifies which variant to use for evaluation.
-/// Either a variant name from the config, or a dynamic variant configuration.
-#[derive(Clone, Debug)]
-pub enum EvaluationVariant {
-    /// Use a variant by name from the config file
-    Name(String),
-    /// Use a dynamically provided variant configuration
-    Info(Box<UninitializedVariantInfo>),
-}
-
-/// Parameters for running an evaluation using run_evaluation_core
-/// This struct encapsulates all the necessary components for evaluation execution
-pub struct EvaluationCoreArgs {
-    /// TensorZero client for making inference requests
-    pub tensorzero_client: Client,
-
-    /// ClickHouse client for database operations
-    pub clickhouse_client: ClickHouseConnectionInfo,
-
-    /// Configuration containing function and evaluation definitions
-    pub config: Arc<Config>,
-
-    /// Name of the evaluation to run.
-    pub evaluation_name: String,
-
-    /// Unique identifier for this evaluation run
-    pub evaluation_run_id: Uuid,
-
-    /// Name of the dataset to run on.
-    pub dataset_name: String,
-
-    /// Variant to use for evaluation.
-    /// Either a variant name from the config file, or a dynamic variant configuration.
-    pub variant: EvaluationVariant,
-
-    /// Number of concurrent requests to make.
-    pub concurrency: usize,
-
-    /// Cache configuration for inference requests
-    pub inference_cache: CacheEnabledMode,
 }
 
 /// High-level wrapper function for running evaluations called from the CLI.
@@ -215,12 +94,32 @@ pub struct EvaluationCoreArgs {
 ///
 /// - `Ok(())` if the evaluation completes successfully and meets all cutoffs
 /// - `Err` if setup fails, evaluation fails, or results don't meet cutoffs
-#[instrument(skip_all, fields(evaluation_run_id = %evaluation_run_id, evaluation_name = %args.evaluation_name, dataset_name = %args.dataset_name, variant_name = %args.variant_name, concurrency = %args.concurrency))]
+#[instrument(skip_all, fields(evaluation_run_id = %evaluation_run_id, evaluation_name = %args.evaluation_name, dataset_name = ?args.dataset_name, num_datapoint_ids = %args.datapoint_ids.as_deref().unwrap_or_default().len(), variant_name = %args.variant_name, concurrency = %args.concurrency))]
 pub async fn run_evaluation(
     args: Args,
     evaluation_run_id: Uuid,
     mut writer: impl Write,
 ) -> Result<()> {
+    // Convert Option<Vec<Uuid>> to Vec<Uuid> (None becomes empty vec)
+    let datapoint_ids = args.datapoint_ids.unwrap_or_default();
+
+    // Validate that exactly one of dataset_name or datapoint_ids is provided
+    if args.dataset_name.is_some() && !datapoint_ids.is_empty() {
+        bail!(
+            "Cannot provide both dataset_name and datapoint_ids. Please specify one or the other."
+        );
+    }
+    if args.dataset_name.is_none() && datapoint_ids.is_empty() {
+        bail!("Must provide either dataset_name or datapoint_ids.");
+    }
+
+    // Validate that max_datapoints is not used with datapoint_ids
+    if !datapoint_ids.is_empty() && args.max_datapoints.is_some() {
+        bail!(
+            "Cannot provide both datapoint_ids and max_datapoints. max_datapoints can only be used with dataset_name."
+        );
+    }
+
     info!("Initializing evaluation environment");
     let clickhouse_url = std::env::var("TENSORZERO_CLICKHOUSE_URL")
         .map_err(|_| anyhow!("Missing ClickHouse URL at TENSORZERO_CLICKHOUSE_URL"))?;
@@ -235,16 +134,35 @@ pub async fn run_evaluation(
     // We do not validate credentials here since we just want the evaluator config
     // If we are using an embedded gateway, credentials are validated when that is initialized
     info!(config_file = ?args.config_file, "Loading configuration");
-    let ConfigLoadInfo {
-        config,
-        snapshot: _, // TODO: do an actual snapshot
-    } = Config::load_from_path_optional_verify_credentials(
+    let unwritten_config = Config::load_from_path_optional_verify_credentials(
         &ConfigFileGlob::new_from_path(&args.config_file)?,
         false,
     )
     .await?;
+    let clickhouse_client = ClickHouseConnectionInfo::new(
+        &clickhouse_url,
+        unwritten_config.gateway.observability.batch_writes.clone(),
+    )
+    .await?;
+    let config = unwritten_config.into_config(&clickhouse_client).await?;
     let config = Arc::new(config);
     debug!("Configuration loaded successfully");
+
+    // Look up evaluation config from the loaded config
+    let evaluation_config = config
+        .evaluations
+        .get(&args.evaluation_name)
+        .ok_or_else(|| anyhow!("evaluation '{}' not found", args.evaluation_name))?
+        .clone();
+
+    // Build function configs table from all functions in config
+    let function_configs: EvaluationFunctionConfigTable = config
+        .functions
+        .iter()
+        .map(|(name, func)| (name.clone(), EvaluationFunctionConfig::from(func.as_ref())))
+        .collect();
+    let function_configs = Arc::new(function_configs);
+
     let tensorzero_client = match args.gateway_url {
         Some(gateway_url) => {
             ClientBuilder::new(ClientBuilderMode::HTTPGateway { url: gateway_url })
@@ -262,17 +180,13 @@ pub async fn run_evaluation(
     .await
     .map_err(|e| anyhow!("Failed to build client: {e}"))?;
 
-    let clickhouse_client = ClickHouseConnectionInfo::new(
-        &clickhouse_url,
-        config.gateway.observability.batch_writes.clone(),
-    )
-    .await?;
-
     let core_args = EvaluationCoreArgs {
         tensorzero_client,
         clickhouse_client: clickhouse_client.clone(),
-        config,
+        evaluation_config,
+        function_configs,
         dataset_name: args.dataset_name,
+        datapoint_ids: Some(datapoint_ids),
         variant: EvaluationVariant::Name(args.variant_name),
         evaluation_name: args.evaluation_name,
         evaluation_run_id,
@@ -420,12 +334,15 @@ pub async fn run_evaluation(
 /// rather than failing the entire evaluation. Error messages include context:
 /// - Inference errors: Include the datapoint_id
 /// - Evaluation errors: Include both the inference_id and datapoint_id
-#[instrument(skip_all, fields(evaluation_run_id = %args.evaluation_run_id, evaluation_name = %args.evaluation_name, dataset_name = %args.dataset_name, variant = ?args.variant, concurrency = %args.concurrency))]
+#[instrument(skip_all, fields(evaluation_run_id = %args.evaluation_run_id, evaluation_name = %args.evaluation_name, dataset_name = ?args.dataset_name, num_datapoint_ids = %args.datapoint_ids.as_deref().unwrap_or_default().len(), variant = ?args.variant, concurrency = %args.concurrency))]
 pub async fn run_evaluation_core_streaming(
     args: EvaluationCoreArgs,
     max_datapoints: Option<u32>,
     precision_targets: HashMap<String, f32>,
 ) -> Result<EvaluationStreamResult> {
+    // Convert Option<Vec<Uuid>> to Vec<Uuid> (None becomes empty vec)
+    let datapoint_ids = args.datapoint_ids.unwrap_or_default();
+
     let (sender, receiver) = mpsc::channel(EVALUATION_CHANNEL_BUFFER_SIZE);
 
     // Build the semaphore and clients
@@ -435,13 +352,8 @@ pub async fn run_evaluation_core_streaming(
         clickhouse_client: args.clickhouse_client,
     });
 
-    // Get evaluation configuration
-    let evaluation_config = args
-        .config
-        .evaluations
-        .get(&args.evaluation_name)
-        .ok_or_else(|| anyhow!("evaluation '{}' not found", args.evaluation_name))?
-        .clone();
+    // Use the pre-resolved evaluation configuration
+    let evaluation_config = args.evaluation_config.clone();
 
     debug!(evaluation_name = %args.evaluation_name, "Evaluation config found");
 
@@ -455,25 +367,57 @@ pub async fn run_evaluation_core_streaming(
 
     let mut join_set = JoinSet::new();
 
-    info!("Querying dataset");
-    #[expect(deprecated)]
-    let request = ListDatapointsRequest {
-        function_name: Some(inference_evaluation_config.function_name.clone()),
-        limit: max_datapoints.or(Some(u32::MAX)), // Use u32::MAX when no limit specified, since otherwise ListDatapointsRequest defaults to 20
-        page_size: None,                          // deprecated but required
-        offset: Some(0),
-        filter: None,
+    // Validate that exactly one of dataset_name or datapoint_ids is provided
+    if args.dataset_name.is_some() && !datapoint_ids.is_empty() {
+        bail!(
+            "Cannot provide both dataset_name and datapoint_ids. Please specify one or the other."
+        );
+    }
+    if args.dataset_name.is_none() && datapoint_ids.is_empty() {
+        bail!("Must provide either dataset_name or datapoint_ids.");
+    }
+
+    // Validate that max_datapoints is not used with datapoint_ids
+    if !datapoint_ids.is_empty() && max_datapoints.is_some() {
+        bail!(
+            "Cannot provide both datapoint_ids and max_datapoints. max_datapoints can only be used with dataset_name."
+        );
+    }
+
+    info!("Loading datapoints");
+    let dataset = if let Some(dataset_name) = &args.dataset_name {
+        // Load from dataset
+        let request = ListDatapointsRequest {
+            function_name: Some(inference_evaluation_config.function_name.clone()),
+            limit: max_datapoints.or(Some(u32::MAX)), // Use u32::MAX when no limit specified, since otherwise ListDatapointsRequest defaults to 20
+            offset: Some(0),
+            ..Default::default()
+        };
+        list_datapoints(&clients.clickhouse_client, dataset_name.clone(), request)
+            .await?
+            .datapoints
+    } else {
+        // Load by IDs
+        let request = GetDatapointsRequest {
+            ids: datapoint_ids.clone(),
+        };
+        get_datapoints(
+            &clients.clickhouse_client,
+            /*dataset_name=*/ None,
+            request,
+        )
+        .await?
+        .datapoints
     };
-    let dataset = list_datapoints(
-        &clients.clickhouse_client,
-        &args.config,
-        args.dataset_name.clone(),
-        request,
-    )
-    .await?
-    .datapoints;
-    info!(dataset_size = dataset.len(), "Dataset loaded successfully");
-    let dataset_name = Arc::new(args.dataset_name);
+    info!(
+        dataset_size = dataset.len(),
+        "Datapoints loaded successfully"
+    );
+    let dataset_name = Arc::new(
+        args.dataset_name
+            .clone()
+            .unwrap_or_else(|| format!("datapoint_ids[{}]", datapoint_ids.len())),
+    );
     let variant = Arc::new(args.variant);
     let evaluation_name = Arc::new(args.evaluation_name);
     let dataset_len = dataset.len();
@@ -503,7 +447,7 @@ pub async fn run_evaluation_core_streaming(
     // Spawn concurrent tasks for each datapoint
     for datapoint in dataset {
         let clients_clone = clients.clone();
-        let config = args.config.clone();
+        let function_configs = args.function_configs.clone();
         let variant = variant.clone();
         let evaluation_config = evaluation_config.clone();
         let dataset_name = dataset_name.clone();
@@ -515,6 +459,7 @@ pub async fn run_evaluation_core_streaming(
         let inference_cache = args.inference_cache;
         let tokens_clone = cancellation_tokens_arc.clone();
         let semaphore_clone = semaphore.clone();
+
         // Skip feedback for dynamic variants (they're not production-ready)
         // Named variants: send_feedback=true, Dynamic variants: send_feedback=false
         let send_feedback = !matches!(variant.as_ref(), EvaluationVariant::Info(_));
@@ -522,7 +467,21 @@ pub async fn run_evaluation_core_streaming(
             // Acquire semaphore permit for the entire task (inference + evaluation)
             let _permit = semaphore_clone.acquire().await?;
 
-            let input = Arc::new(resolved_input_to_client_input(datapoint.input().clone().reresolve(&clients_clone.tensorzero_client).await?)?);
+            // Look up function config from table
+            let function_config = function_configs
+                .get(&function_name)
+                .ok_or_else(|| anyhow!("Function '{function_name}' not found in function configs table"))?;
+
+            // Convert Input back to StoredInput, then use reresolve() which delegates
+            // to the TensorZero client. This currently requires us to configure `tensorzero_client` in
+            // HTTPGateway mode for the UI e2e tests to pass (we can't construct a `FetchContext` and
+            // load data from `Input`).
+            //
+            // TODO(#4844): Rethink file loading architecture, so we can do this without requiring a client in HTTP gateway mode.
+            let stored_input = datapoint.input().clone().into_stored_input_without_file_handling()?;
+            let resolved_input = stored_input.reresolve(&clients_clone.tensorzero_client).await?;
+            let input = Arc::new(resolved_input_to_client_input(resolved_input)?);
+
             let inference_response = Arc::new(
                 infer_datapoint(InferDatapointParams {
                     clients: &clients_clone,
@@ -532,7 +491,7 @@ pub async fn run_evaluation_core_streaming(
                     dataset_name: &dataset_name,
                     datapoint: &datapoint,
                     evaluation_name: &evaluation_name,
-                    config: &config,
+                    function_config,
                     input: &input,
                     inference_cache,
                 })
@@ -616,11 +575,11 @@ pub async fn run_evaluation_core_streaming(
             };
 
             // Check if update is Some; if so, unwrap and send inner value
-            if let Some(update_value) = update {
-                if sender_clone.send(update_value).await.is_err() {
-                    // Receiver dropped, stop sending
-                    break;
-                }
+            if let Some(update_value) = update
+                && sender_clone.send(update_value).await.is_err()
+            {
+                // Receiver dropped, stop sending
+                break;
             }
         }
     });
@@ -681,9 +640,9 @@ struct InferDatapointParams<'a> {
     evaluation_run_id: Uuid,
     dataset_name: &'a str,
     datapoint: &'a Datapoint,
-    input: &'a ClientInput,
+    input: &'a Input,
     evaluation_name: &'a str,
-    config: &'a Config,
+    function_config: &'a EvaluationFunctionConfig,
     inference_cache: CacheEnabledMode,
 }
 
@@ -697,7 +656,7 @@ async fn infer_datapoint(params: InferDatapointParams<'_>) -> Result<InferenceRe
         dataset_name,
         datapoint,
         evaluation_name,
-        config,
+        function_config,
         input,
         inference_cache,
     } = params;
@@ -725,11 +684,15 @@ async fn infer_datapoint(params: InferDatapointParams<'_>) -> Result<InferenceRe
         }
     };
     debug!("Processing output schema");
-    let function_config = config.get_function(function_name)?;
-    let output_schema = match (datapoint.output_schema(), &**function_config) {
+    let output_schema = match (datapoint.output_schema(), function_config) {
         // If the datapoint has an output schema, use it only in the case where it is not the same as the output schema of the function
-        (Some(output_schema), FunctionConfig::Json(json_function_config)) => {
-            if output_schema == &json_function_config.output_schema.value {
+        (
+            Some(output_schema),
+            EvaluationFunctionConfig::Json {
+                output_schema: fn_schema,
+            },
+        ) => {
+            if output_schema == &fn_schema.value {
                 debug!("Output schema matches function schema, using function default");
                 None
             } else {
@@ -737,7 +700,7 @@ async fn infer_datapoint(params: InferDatapointParams<'_>) -> Result<InferenceRe
                 Some(output_schema)
             }
         }
-        (Some(_), FunctionConfig::Chat(_)) => {
+        (Some(_), EvaluationFunctionConfig::Chat) => {
             return Err(anyhow!("Chat function does not support output schema"));
         }
         (None, _) => {
@@ -782,6 +745,7 @@ async fn infer_datapoint(params: InferDatapointParams<'_>) -> Result<InferenceRe
         extra_headers: Default::default(),
         internal_dynamic_variant_config: internal_dynamic_variant_config.clone(),
         otlp_traces_extra_headers: HashMap::new(),
+        api_key: None,
     };
     debug!("Making inference request");
     let inference_result = clients.tensorzero_client.inference(params).await?;
@@ -812,19 +776,6 @@ fn write_run_info(
         }
     }
     Ok(())
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunInfo {
-    pub evaluation_run_id: Uuid,
-    pub num_datapoints: usize,
-}
-
-/// Result from running an evaluation that supports streaming
-pub struct EvaluationStreamResult {
-    pub receiver: mpsc::Receiver<EvaluationUpdate>,
-    pub run_info: RunInfo,
-    pub evaluation_config: Arc<EvaluationConfig>,
 }
 
 #[cfg(test)]

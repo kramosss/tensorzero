@@ -3,10 +3,10 @@ use std::time::Duration;
 
 use crate::{
     inference::types::{
-        chat_completion_inference_params::{
-            warn_inference_parameter_not_supported, ChatCompletionInferenceParamsV2, ServiceTier,
-        },
         ProviderInferenceResponseStreamInner, ThoughtSummaryBlock,
+        chat_completion_inference_params::{
+            ChatCompletionInferenceParamsV2, ServiceTier, warn_inference_parameter_not_supported,
+        },
     },
     tool::{OpenAICustomTool, OpenAICustomToolFormat, OpenAIGrammarSyntax, ToolConfigRef},
 };
@@ -15,25 +15,24 @@ const PROVIDER_NAME: &str = "OpenAI Responses";
 use crate::providers::helpers::convert_stream_error;
 use crate::{error::IMPOSSIBLE_ERROR_MESSAGE, inference::TensorZeroEventError};
 use futures::StreamExt;
-use futures::{future::try_join_all, Stream};
+use futures::{Stream, future::try_join_all};
 use reqwest_eventsource::Event;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::time::Instant;
 use url::Url;
 
 use crate::{
-    error::{warn_discarded_thought_block, Error, ErrorDetails},
+    error::{Error, ErrorDetails, warn_discarded_thought_block},
     inference::types::{
-        file::Detail, ContentBlock, ContentBlockChunk, ContentBlockOutput, FinishReason,
-        FlattenUnknown, Latency, ModelInferenceRequest, ModelInferenceRequestJsonMode,
-        ProviderInferenceResponse, ProviderInferenceResponseArgs, ProviderInferenceResponseChunk,
-        RequestMessage, Role, Text, TextChunk, Thought, ThoughtChunk, UnknownChunk, Usage,
+        ContentBlock, ContentBlockChunk, ContentBlockOutput, FinishReason, FlattenUnknown, Latency,
+        ModelInferenceRequest, ModelInferenceRequestJsonMode, ProviderInferenceResponse,
+        ProviderInferenceResponseArgs, ProviderInferenceResponseChunk, RequestMessage, Role, Text,
+        TextChunk, Thought, ThoughtChunk, Unknown, UnknownChunk, Usage, file::Detail,
     },
-    model::fully_qualified_name,
     providers::openai::{
-        prepare_file_message, prepare_system_or_developer_message_helper, OpenAIContentBlock,
-        OpenAIFile, OpenAIMessagesConfig, OpenAITool, SystemOrDeveloper, PROVIDER_TYPE,
+        OpenAIContentBlock, OpenAIFile, OpenAIMessagesConfig, OpenAITool, PROVIDER_TYPE,
+        SystemOrDeveloper, prepare_file_message, prepare_system_or_developer_message_helper,
     },
     tool::{ToolCall, ToolCallChunk, ToolChoice},
 };
@@ -219,10 +218,11 @@ impl OpenAIResponsesResponse<'_> {
                     output.push(ContentBlockOutput::Thought(thought));
                 }
                 FlattenUnknown::Unknown(data) => {
-                    output.push(ContentBlockOutput::Unknown {
+                    output.push(ContentBlockOutput::Unknown(Unknown {
                         data: data.into_owned(),
-                        model_provider_name: Some(fully_qualified_name(model_name, provider_name)),
-                    });
+                        model_name: Some(model_name.to_string()),
+                        provider_name: Some(provider_name.to_string()),
+                    }));
                 }
             }
         }
@@ -632,10 +632,10 @@ impl OpenAIResponsesInput<'_> {
         match self {
             OpenAIResponsesInput::Known(OpenAIResponsesInputInner::Message(msg)) => {
                 for block in &msg.content {
-                    if let OpenAIResponsesInputMessageContent::InputText { text } = block {
-                        if text.to_lowercase().contains(value) {
-                            return true;
-                        }
+                    if let OpenAIResponsesInputMessageContent::InputText { text } = block
+                        && text.to_lowercase().contains(value)
+                    {
+                        return true;
                     }
                 }
                 false
@@ -876,10 +876,7 @@ async fn tensorzero_to_openai_responses_user_messages<'a>(
             ContentBlock::Thought(thought) => {
                 warn_discarded_thought_block(messages_config.provider_type, thought);
             }
-            ContentBlock::Unknown {
-                data,
-                model_provider_name: _,
-            } => {
+            ContentBlock::Unknown(Unknown { data, .. }) => {
                 // The user included an 'unknown' content block inside of the user message,
                 // so push a new user message that includes their custom JSON value
                 messages.push(OpenAIResponsesInput::Unknown(Cow::Borrowed(data)));
@@ -953,8 +950,7 @@ pub fn tensorzero_to_openai_responses_assistant_message<'a>(
                     message: "Files are not supported in assistant messages".to_string(),
                 }));
             }
-            Cow::Borrowed(ContentBlock::Thought(ref thought))
-            | Cow::Owned(ContentBlock::Thought(ref thought)) => {
+            Cow::Borrowed(ContentBlock::Thought(thought)) => {
                 if let Some(encrypted_content) = &thought.signature {
                     output.push(OpenAIResponsesInput::Known(
                         OpenAIResponsesInputInner::Reasoning(OpenAIResponsesReasoning {
@@ -979,17 +975,35 @@ pub fn tensorzero_to_openai_responses_assistant_message<'a>(
                     ));
                 }
             }
+            Cow::Owned(ContentBlock::Thought(thought)) => {
+                if let Some(encrypted_content) = thought.signature {
+                    output.push(OpenAIResponsesInput::Known(
+                        OpenAIResponsesInputInner::Reasoning(OpenAIResponsesReasoning {
+                            encrypted_content: Cow::Owned(encrypted_content),
+                            summary: thought
+                                .summary
+                                .map(|summary| {
+                                    summary
+                                        .into_iter()
+                                        .map(|block| match block {
+                                            ThoughtSummaryBlock::SummaryText { text } => {
+                                                OpenAIResponsesReasoningSummary::SummaryText {
+                                                    text: Cow::Owned(text),
+                                                }
+                                            }
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                        }),
+                    ));
+                }
+            }
 
-            Cow::Borrowed(ContentBlock::Unknown {
-                data,
-                model_provider_name: _,
-            }) => {
+            Cow::Borrowed(ContentBlock::Unknown(Unknown { data, .. })) => {
                 output.push(OpenAIResponsesInput::Unknown(Cow::Borrowed(data)));
             }
-            Cow::Owned(ContentBlock::Unknown {
-                data,
-                model_provider_name: _,
-            }) => {
+            Cow::Owned(ContentBlock::Unknown(Unknown { data, .. })) => {
                 output.push(OpenAIResponsesInput::Unknown(Cow::Owned(data)));
             }
         }
@@ -1317,10 +1331,8 @@ pub(super) fn openai_responses_to_tensorzero_chunk(
                         vec![ContentBlockChunk::Unknown(UnknownChunk {
                             id: output_index.to_string(),
                             data: item,
-                            model_provider_name: Some(fully_qualified_name(
-                                model_name,
-                                provider_name,
-                            )),
+                            model_name: Some(model_name.to_string()),
+                            provider_name: Some(provider_name.to_string()),
                         })],
                         None,
                         raw_message,
@@ -1459,7 +1471,8 @@ pub(super) fn openai_responses_to_tensorzero_chunk(
                 vec![ContentBlockChunk::Unknown(UnknownChunk {
                     id: "unknown".to_string(),
                     data,
-                    model_provider_name: Some(fully_qualified_name(model_name, provider_name)),
+                    model_name: Some(model_name.to_string()),
+                    provider_name: Some(provider_name.to_string()),
                 })],
                 None,
                 raw_message,
@@ -2451,18 +2464,17 @@ mod tests {
         assert_eq!(provider_response.output.len(), 1);
 
         match &provider_response.output[0] {
-            ContentBlockOutput::Unknown {
+            ContentBlockOutput::Unknown(Unknown {
                 data,
-                model_provider_name,
-            } => {
+                model_name,
+                provider_name,
+            }) => {
                 assert_eq!(
                     data.get("type").and_then(|v| v.as_str()),
                     Some("web_search_call")
                 );
-                assert_eq!(
-                    model_provider_name.as_deref(),
-                    Some("tensorzero::model_name::test-model::provider_name::test-provider")
-                );
+                assert_eq!(model_name.as_deref(), Some("test-model"));
+                assert_eq!(provider_name.as_deref(), Some("test-provider"));
             }
             _ => panic!("Expected ContentBlockOutput::Unknown"),
         }
@@ -2561,7 +2573,7 @@ mod tests {
 
         // Second should be unknown (web_search_call)
         match &provider_response.output[1] {
-            ContentBlockOutput::Unknown { data, .. } => {
+            ContentBlockOutput::Unknown(Unknown { data, .. }) => {
                 assert_eq!(
                     data.get("type").and_then(|v| v.as_str()),
                     Some("web_search_call")
@@ -2581,10 +2593,11 @@ mod tests {
 
         // Fourth should be unknown (another_unknown_type)
         match &provider_response.output[3] {
-            ContentBlockOutput::Unknown {
+            ContentBlockOutput::Unknown(Unknown {
                 data,
-                model_provider_name,
-            } => {
+                model_name,
+                provider_name,
+            }) => {
                 assert_eq!(
                     data.get("type").and_then(|v| v.as_str()),
                     Some("another_unknown_type")
@@ -2593,10 +2606,8 @@ mod tests {
                     data.get("custom_field").and_then(|v| v.as_str()),
                     Some("custom_value")
                 );
-                assert_eq!(
-                    model_provider_name.as_deref(),
-                    Some("tensorzero::model_name::gpt-5-nano::provider_name::openai")
-                );
+                assert_eq!(model_name.as_deref(), Some("gpt-5-nano"));
+                assert_eq!(provider_name.as_deref(), Some("openai"));
             }
             _ => panic!("Expected ContentBlockOutput::Unknown for another_unknown_type"),
         }
